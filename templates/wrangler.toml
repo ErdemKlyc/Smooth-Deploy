@@ -1,0 +1,9 @@
+name = "__PROJECT__"
+compatibility_date = "2025-01-01"
+pages_build_output_dir = "./dist"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "__PROJECT__"
+database_id = "__DATABASE_ID__"
+migrations_dir = "migrations"
