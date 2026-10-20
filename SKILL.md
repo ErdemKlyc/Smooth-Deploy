@@ -67,7 +67,7 @@ Copy from `templates/`:
 | `functions/_auth.ts` | PBKDF2 verify, constant-time compare, dummy hash for unknown emails, session create/lookup, cookie helpers |
 | `functions/api/_middleware.ts` | Guards every `/api/*` route except `/api/auth/login`; sets `ctx.data.user` |
 | `functions/api/auth/login.ts`, `logout.ts`, `me.ts` | Login (5 fails lock 15 min, same error for unknown email and wrong password), logout (deletes session), current user |
-| `scripts/create-user.mjs` | Creates or resets a user from the CLI. Reads the DB name from `wrangler.toml`. Re-running resets the password and kills that user's sessions |
+| `scripts/create-user.mjs` | Creates or resets a user from the CLI. Reads the DB name from `wrangler.toml`. Re-running resets the password and kills that user's sessions. Writes the SQL to a temp file, runs `wrangler d1 execute --file` through `node` with no shell, then reads the hash back and fails loudly if it doesn't match |
 | `src/api.ts` | `req()` helper that broadcasts 401s, plus `me` / `login` / `logout` |
 | `src/auth.tsx` | `AuthProvider` + `useAuth()` |
 | `src/pages/Login.tsx`, `src/auth.css` | Login page |
@@ -141,6 +141,7 @@ npx wrangler d1 execute __PROJECT__ --remote --command "DELETE FROM sessions WHE
 ```
 
 Rules when changing `create-user.mjs` or the auth schema:
+- **Never pass the hash through a shell.** The stored format `pbkdf2$100000$<salt>$<hash>` contains `$`. `sh` and `bash` expand `$1` and similar inside double quotes, which silently corrupts every hash so that nobody can log in (cmd.exe on Windows doesn't expand `$`, so the bug hides there). Don't use `execSync` with `--command "..."`. Use `spawnSync(process.execPath, [wranglerBin, ...])` with `--file`, as the template does, and keep the read-back check.
 - Keep the reset an **upsert on `email`**. Never use `INSERT OR REPLACE` or delete-then-insert. SQLite's REPLACE deletes the old row, which changes the user id and cascades `ON DELETE CASCADE` deletes to the user's tokens and any other owned rows.
 - If you add tables that belong to a user, reference `users(id)` (not email), so resetting or renaming never orphans them.
 - Never pass the password through the chat. Tell the user to run the command in their own terminal.
@@ -156,6 +157,7 @@ Optional upgrades (offer them, don't build them by default):
 - `wrangler d1 migrations apply --remote` asks for confirmation; in CI or non-interactive shells it falls back to "yes".
 - Windows: run `wrangler pages dev` with `nohup ... &` and a unique `--port`. Old dev servers keep ports open (`netstat -ano | grep <port>`, then `taskkill //F //PID <pid> //T`). A stale `.wrangler/tmp` causes "Could not resolve middleware-loader.entry.ts"; delete `.wrangler/tmp` and restart.
 - The `--` in `npm run user:create -- email` is required so the arguments reach the script.
+- **"Invalid email or password" for every user right after creating them** (especially on macOS or Linux) means the password hash was corrupted on its way into D1. Older copies of `create-user.mjs` ran it through a shell, which expanded the `$` signs. Replace the script with the current template and re-run `user:create` for each user. Their data is kept.
 - **Several `gh` accounts**: if `git push` says "Repository not found" for a private repo, the active `gh` account is probably not the owner (`gh auth status`). Don't switch the user's account silently. Push once with `GH_TOKEN=$(gh auth token -u <owner>) git push`, and tell the user they can run `gh auth switch -u <owner>`.
 - `Secure` cookies still work on `http://localhost` in browsers and curl, so there's no need for a dev-only cookie flag.
 - Validate user-supplied URLs server-side and allow only `http:` and `https:` (blocks `javascript:` links). Accept images only as `data:image/(png|jpeg|webp)` with a size cap, and never SVG.
