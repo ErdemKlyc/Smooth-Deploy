@@ -106,6 +106,49 @@ Run these in order; check each result before moving on.
 
 From then on every push to `main` deploys, and new `migrations/*.sql` files are applied automatically.
 
+11. **Hand-off**: tell the user how to recover a forgotten password (Part 4) before you finish. There is no "Forgot password?" link, so this is their only way back in.
+
+## Part 4: Users and password recovery
+
+There is no self-service reset. Recovery is done from the CLI by anyone who is logged into the Cloudflare account with `wrangler`. That login is the trust anchor.
+
+**Forgotten password (reset)**: from the project folder, run
+```
+npm run user:create -- their@email
+```
+It prompts for a new password of at least 10 characters. Re-running it for an existing email:
+- replaces the password hash
+- clears `failed_count` and `locked_until`, which also unlocks an account locked by failed attempts
+- deletes that user's sessions, signing them out on every device
+
+**It does not delete any data.** The user row is updated in place (`INSERT ... ON CONFLICT(email) DO UPDATE`), so the user id stays the same. Everything else is untouched: app data, rows that reference `users(id)` (for example API or MCP tokens), and anything else the user created. Reassure the user about this if they ask.
+
+If `wrangler` reports "Not logged in" or an expired token, run `npx wrangler login` first.
+
+Other user operations (remote; use `--local` for the dev DB):
+```
+# list users (emails only, never select password_hash)
+npx wrangler d1 execute __PROJECT__ --remote --command "SELECT id, email, created_at, locked_until FROM users"
+
+# unlock without changing the password
+npx wrangler d1 execute __PROJECT__ --remote --command "UPDATE users SET failed_count = 0, locked_until = 0 WHERE email = 'their@email'"
+
+# sign a user out everywhere
+npx wrangler d1 execute __PROJECT__ --remote --command "DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE email = 'their@email')"
+
+# remove a user (confirm with the user first; this cascades to rows referencing users(id))
+npx wrangler d1 execute __PROJECT__ --remote --command "DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE email = 'their@email'); DELETE FROM users WHERE email = 'their@email'"
+```
+
+Rules when changing `create-user.mjs` or the auth schema:
+- Keep the reset an **upsert on `email`**. Never use `INSERT OR REPLACE` or delete-then-insert. SQLite's REPLACE deletes the old row, which changes the user id and cascades `ON DELETE CASCADE` deletes to the user's tokens and any other owned rows.
+- If you add tables that belong to a user, reference `users(id)` (not email), so resetting or renaming never orphans them.
+- Never pass the password through the chat. Tell the user to run the command in their own terminal.
+
+Optional upgrades (offer them, don't build them by default):
+- **Change password in Settings**: an endpoint that takes the current and the new password, verifies the current one with `verifyPassword`, writes a new PBKDF2 hash and deletes the user's other sessions. No extra services needed.
+- **Email reset link**: needs an email provider (for example Cloudflare Email Sending or Resend). Store a single-use, SHA-256-hashed token with a 30-minute expiry. Return the same response whether or not the email exists, and rate-limit requests.
+
 ## Gotchas learned the hard way
 
 - **Don't mix deploy methods.** A Pages project created with `wrangler pages project create` (direct upload) can **never** be connected to Git later, and the Cloudflare Git integration cannot be set up from the CLI. This skill always uses GitHub Actions plus direct upload.
@@ -113,6 +156,7 @@ From then on every push to `main` deploys, and new `migrations/*.sql` files are 
 - `wrangler d1 migrations apply --remote` asks for confirmation; in CI or non-interactive shells it falls back to "yes".
 - Windows: run `wrangler pages dev` with `nohup ... &` and a unique `--port`. Old dev servers keep ports open (`netstat -ano | grep <port>`, then `taskkill //F //PID <pid> //T`). A stale `.wrangler/tmp` causes "Could not resolve middleware-loader.entry.ts"; delete `.wrangler/tmp` and restart.
 - The `--` in `npm run user:create -- email` is required so the arguments reach the script.
+- **Several `gh` accounts**: if `git push` says "Repository not found" for a private repo, the active `gh` account is probably not the owner (`gh auth status`). Don't switch the user's account silently. Push once with `GH_TOKEN=$(gh auth token -u <owner>) git push`, and tell the user they can run `gh auth switch -u <owner>`.
 - `Secure` cookies still work on `http://localhost` in browsers and curl, so there's no need for a dev-only cookie flag.
 - Validate user-supplied URLs server-side and allow only `http:` and `https:` (blocks `javascript:` links). Accept images only as `data:image/(png|jpeg|webp)` with a size cap, and never SVG.
 - Cloudflare Access is unnecessary when this auth is in place. Mention it only if the user wants SSO.
