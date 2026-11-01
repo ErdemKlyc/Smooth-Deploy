@@ -1,13 +1,13 @@
 ---
 name: smooth-deploy
-description: Ship a React + TypeScript web app to Cloudflare Pages with Pages Functions and a D1 database, deployed from a GitHub repo through GitHub Actions, driven end to end from the gh and wrangler CLIs. Includes invite-only email/password auth (no signup; users created from the CLI), PBKDF2 password hashing, D1-backed session cookies, login lockout, and a login page. Use when the user wants to create, deploy or put live a web app on Cloudflare (Pages, Workers, D1) with GitHub, wants CI/CD from GitHub to Cloudflare, or wants to add private/invite-only login with email and password to a Cloudflare Pages app, even if they only say "make it live", "deploy it", "only some people should log in" or "use my usual setup".
+description: Ship a React + TypeScript web app to Cloudflare Pages with Pages Functions and a D1 database, deployed from a GitHub repo through GitHub Actions, driven end to end from the gh and wrangler CLIs. Asks which auth model to use: single-tenant (invite-only email/password, users created from the CLI) or multi-tenant (public signup, one isolated workspace per signup) with Google sign-in, email + password signup, or both. Includes PBKDF2 password hashing, D1-backed session cookies, login lockout, Google OAuth and a login page. Use when the user wants to create, deploy or put live a web app on Cloudflare (Pages, Workers, D1) with GitHub, wants CI/CD from GitHub to Cloudflare, or wants login, signup, Google sign-in or user accounts on a Cloudflare Pages app, even if they only say "make it live", "deploy it", "only some people should log in", "let users sign up" or "use my usual setup".
 license: MIT
 compatibility: Claude Code or any agent with a shell. Needs Node.js 20+, git, the GitHub CLI (gh) logged in, and wrangler (installed as a dev dependency). Works on Windows (Git Bash), macOS and Linux.
 ---
 
 # Smooth-Deploy
 
-A proven recipe: **React + TypeScript (Vite)** front end, **Cloudflare Pages Functions** API under `/api`, **Cloudflare D1** database, **GitHub** repo, **GitHub Actions** deploy on every push to `main`, and **invite-only email/password auth**. Everything is done with `gh` and `wrangler`; the only manual step is creating one Cloudflare API token.
+A proven recipe: **React + TypeScript (Vite)** front end, **Cloudflare Pages Functions** API under `/api`, **Cloudflare D1** database, **GitHub** repo, **GitHub Actions** deploy on every push to `main`, and **auth you choose per app** (single-tenant invite-only, or multi-tenant with Google and/or email signup). Everything is done with `gh` and `wrangler`; the only manual steps are creating one Cloudflare API token and, for Google sign-in, one Google OAuth client.
 
 Template files live in `templates/` next to this file. Copy them, replace the placeholders, then adapt.
 
@@ -16,11 +16,19 @@ Template files live in `templates/` next to this file. Copy them, replace the pl
 | `__PROJECT__` | Lowercase project slug, used for the Pages project and D1 database name (e.g. `projectplane`) |
 | `__DATABASE_ID__` | The id printed by `wrangler d1 create` |
 | `__APP_TITLE__` | Title shown on the login page |
+| `__GOOGLE_CLIENT_ID__` | Multi-tenant + Google only: the OAuth client ID from Google Cloud Console (not secret) |
 
 ## Ask first (only what you can't infer)
 
 - Repo name and **visibility** (default: private) and which `gh` account (check `gh auth status`; if several, confirm the active one).
-- Whether auth is wanted. If yes, it is invite-only by default; ask before adding any signup flow.
+- **Auth model.** Always ask this, as one question with these options, unless the user already said:
+  1. **No auth** (public app or internal tool behind something else).
+  2. **Single-tenant, invite-only email + password.** One owner or one team shares one dataset. No signup page; the developer creates each user from the CLI. This is the default if they are unsure.
+  3. **Multi-tenant, Google sign-in.** Anyone can sign up with their Google account. Each new signup gets their own isolated workspace (tenant).
+  4. **Multi-tenant, email + password signup.** Same, but with a signup form instead of Google.
+  5. **Multi-tenant, both** Google and email + password.
+
+  "Tenant" means a separate workspace whose data no other tenant can see. If the user says "multi-tenant" without a method, ask Google, email or both. For 3 to 5, also ask for the app's public name (login page title). Warn that public signup invites abuse and offer Cloudflare Turnstile on the signup form (the `cloudflare:turnstile-spin` skill does this).
 
 Do not ask about hosting style or CI: this skill's answer is Pages + Functions + D1 + GitHub Actions.
 
@@ -57,7 +65,11 @@ Do not ask about hosting style or CI: this skill's answer is Pages + Functions +
 5. API conventions: export `onRequestGet` / `onRequestPost` / `onRequestPut` / `onRequestDelete` typed `PagesFunction<Env>`; always use `env.DB.prepare(...).bind(...)` (never string-concatenate SQL); use `RETURNING *` to send back the saved row; use `env.DB.batch([...])` for multi-statement deletes.
 6. SPA routing works automatically on Pages when there is no `404.html`: unknown paths serve `index.html`, and `/api/*` hits Functions first.
 
-## Part 2: Auth (invite-only email + password)
+## Part 2: Auth
+
+Follow the section for the model chosen in "Ask first". Skip Part 2 entirely for **No auth**. Everything else in the recipe (scaffold, CI, go-live) is identical for all models, except the extra Google steps in Part 3.
+
+### 2A: Single-tenant (invite-only email + password)
 
 Copy from `templates/`:
 
@@ -80,16 +92,69 @@ Design rules (keep them when adapting):
 - Session token = 32 random bytes; **only its SHA-256 is stored**. Cookie: `HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800`. SameSite=Lax plus JSON bodies is the CSRF defence; don't add CORS headers.
 - Never log or echo passwords or tokens. Tell the user to run `user:create` themselves so the password never passes through the chat.
 
+### 2B: Multi-tenant (public signup, one workspace per signup)
+
+Copy the 2A files first, then **copy `templates/multitenant/` over them** (same relative paths, replacing what is there). Then keep only what the chosen method needs.
+
+| File (in `templates/multitenant/`) | Purpose |
+|---|---|
+| `migrations/0001_auth.sql` | `tenants`, `users` (tenant_id, nullable `password_hash`, `google_sub`, `email_verified`, role), `sessions` |
+| `functions/_lib.ts` | Same helpers, `Env` adds the optional Google vars |
+| `functions/_auth.ts` | Same PBKDF2 and session code, plus `hashPassword` (Workers), `createTenantUser` (tenant and owner in one transaction) and tenant-aware `currentUser` |
+| `functions/api/_middleware.ts` | Guards `/api/*` except the public auth routes; sets `ctx.data.user` and `ctx.data.tenantId` |
+| `functions/api/auth/login.ts`, `signup.ts`, `me.ts` | Email + password. `signup.ts` creates a new tenant and its owner |
+| `functions/api/auth/google.ts`, `google/callback.ts` | Google OAuth: redirect with a `state` cookie, then code exchange and claims check |
+| `scripts/reset-password.mjs` | Password recovery for an existing account (there is no `create-user` here, users sign up themselves) |
+| `src/api.ts`, `src/auth.tsx`, `src/pages/Login.tsx`, `src/auth.css`, `src/UserMenu.tsx` | Login page with Google button, sign in / create account toggle, workspace name in the header |
+
+Keep only the method chosen:
+
+| Choice | Keep | Delete | Set in `Login.tsx` |
+|---|---|---|---|
+| Google | `google.ts`, `google/callback.ts` | `login.ts`, `signup.ts` | `GOOGLE = true`, `EMAIL = false` |
+| Email | `login.ts`, `signup.ts` | `google.ts`, `google/` | `GOOGLE = false`, `EMAIL = true` |
+| Both | everything | nothing | both `true` |
+
+Also remove the deleted routes from the `PUBLIC` set in `_middleware.ts`, drop the unused `GOOGLE_*` fields from `Env` if Google is not used, and use `"user:reset": "node scripts/reset-password.mjs"` instead of `user:create` in `package.json` (and drop it entirely if Google-only).
+
+**Tenant isolation (the rule that matters most).** Every app table gets `tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE` plus an index on it. Every query filters and every insert sets `tenant_id` from `ctx.data.tenantId`, which comes from the session:
+```ts
+const tenantId = data.tenantId as number;
+env.DB.prepare('SELECT * FROM items WHERE tenant_id = ?1 AND id = ?2').bind(tenantId, id)   // reads, updates, deletes
+env.DB.prepare('INSERT INTO items (tenant_id, name) VALUES (?1, ?2) RETURNING *').bind(tenantId, name)
+```
+Never take a tenant id from the request body, URL or headers. Fetching by `id` alone is a cross-tenant leak: always add `AND tenant_id = ?`. When you review the finished app, grep every `prepare(` call on app tables for `tenant_id`.
+
+Design rules (keep them when adapting):
+- Same session, hashing and cookie rules as 2A. One user belongs to exactly one tenant (email is globally unique). Inviting teammates into a tenant is an optional upgrade, not built.
+- **Google:** OAuth authorization-code flow on the server only. Check `state` against the `pp_oauth` cookie, then require `iss`, `aud` = your client ID, unexpired `exp` and `email_verified === true`. Match users by `google_sub`, never by email alone. Request only `openid email profile`.
+- **Pre-hijack defence.** Email signup does not verify the address. If someone later signs in with Google using an email that has an unverified password account, Google proves ownership: the account is claimed, its password is removed and its sessions are deleted. Keep that logic if you change the callback. If you add email verification, set `email_verified = 1` on confirmation and the callback will then link instead of claim.
+- Login keeps the 5 failures lock and the identical error for unknown email, Google-only account and wrong password. Signup does reveal that an email is taken (409); that is normal for public signup.
+- Minimum password 10 characters, enforced by the server.
+
 ## Part 3: Go live (all CLI)
 
 Run these in order; check each result before moving on.
 
-1. **Local check**: `npm run typecheck && npm run build && npm run db:migrate:local`, then `npm run dev:api` and hit the API with curl. For auth, test: no cookie gives 401, wrong password gives 401, right password gives 200 plus cookie, logout then 401, and six bad attempts give 429.
+1. **Local check**: `npm run typecheck && npm run build && npm run db:migrate:local`, then `npm run dev:api` and hit the API with curl. For auth, test: no cookie gives 401, wrong password gives 401, right password gives 200 plus cookie, logout then 401, and six bad attempts give 429. For multi-tenant email signup also test: signup returns 201 plus cookie, a second signup with the same email gives 409, and **two accounts cannot see each other's rows** (create an item as user A, then request it as user B and expect 404 or an empty list). Google cannot be tested until the OAuth client exists (step 5).
 2. **GitHub**: `git init`, commit, `git branch -M main`, then
    `gh repo create <Name> --private --source=. --remote=origin --push`
 3. **Cloudflare login**: `npx wrangler whoami`. If not logged in or the token has expired, run `npx wrangler login` in the background (the user approves in the browser), then wait for "Successfully logged in".
 4. **D1**: `npx wrangler d1 create __PROJECT__`, put the printed `database_id` in `wrangler.toml`, then `npm run db:migrate:remote`. Commit.
 5. **Pages project**: `npx wrangler pages project create __PROJECT__ --production-branch main`.
+   - **Multi-tenant with Google only (the other manual step).** Cloudflare cannot create Google OAuth clients, so ask the user to:
+     - open https://console.cloud.google.com/apis/credentials (create or pick a project; if asked, configure the OAuth consent screen with the app name and their email, user type External)
+     - **Create credentials**, **OAuth client ID**, application type **Web application**
+     - under **Authorized redirect URIs** add `https://__PROJECT__.pages.dev/api/auth/google/callback` and `http://localhost:8788/api/auth/google/callback` (add the custom domain's callback too if there is one; every origin needs its own entry)
+     - paste the **Client ID** into the chat (not secret) and keep the **Client secret** to themselves
+     - run `npx wrangler pages secret put GOOGLE_CLIENT_SECRET --project-name __PROJECT__` and paste the secret there (never in chat). For local testing, put `GOOGLE_CLIENT_ID=...` and `GOOGLE_CLIENT_SECRET=...` in `.dev.vars` (already git-ignored).
+
+     Then add the client ID to `wrangler.toml` and commit:
+     ```toml
+     [vars]
+     GOOGLE_CLIENT_ID = "__GOOGLE_CLIENT_ID__"
+     ```
+     Tell the user that while the consent screen is in "Testing" only listed test users can sign in; for public signup they must click **Publish app** (basic scopes `openid email profile` need no Google review).
 6. **Account ID** (not secret): get it from `npx wrangler whoami`, then
    `gh variable set CLOUDFLARE_ACCOUNT_ID --body <id>`
 7. **API token (the one manual step)**. wrangler's OAuth login cannot mint API tokens. Ask the user to:
@@ -100,15 +165,17 @@ Run these in order; check each result before moving on.
 
    **Do not push the workflow until the secret exists**, otherwise the first run fails. Verify with `gh secret list`.
 8. **Deploy**: `git push`, then `gh run watch <id> --exit-status`. The workflow does `npm ci`, typecheck, build, `d1 migrations apply --remote`, then `pages deploy dist`.
-9. **Verify live**: `curl https://__PROJECT__.pages.dev/api/...`. With auth, an unauthenticated request must return 401.
-10. **First user**: ask the user to run `npm run user:create -- their@email` from the project folder (it prompts for a password). Confirm with
+9. **Verify live**: `curl https://__PROJECT__.pages.dev/api/...`. With auth, an unauthenticated request must return 401. With Google, open the live URL in a browser, click **Continue with Google**, and confirm you land signed in and `GET /api/auth/me` shows the workspace.
+10. **First user (single-tenant only; multi-tenant users sign up in the app, so just ask the developer to sign up once and confirm a row appears)**: ask the user to run `npm run user:create -- their@email` from the project folder (it prompts for a password). Confirm with
     `npx wrangler d1 execute __PROJECT__ --remote --command "SELECT email, created_at FROM users"`, which shows emails only and never hashes.
 
 From then on every push to `main` deploys, and new `migrations/*.sql` files are applied automatically.
 
-11. **Hand-off**: tell the user how to recover a forgotten password (Part 4) before you finish. There is no "Forgot password?" link, so this is their only way back in.
+11. **Hand-off**: tell the user how to recover a forgotten password (Part 4) before you finish. There is no "Forgot password?" link, so this is their only way back in. For multi-tenant, also say what is not built: email verification, password reset by email, teammate invites and billing. Offer them.
 
 ## Part 4: Users and password recovery
+
+Applies to single-tenant (2A). For multi-tenant, use `npm run user:reset -- their@email` (same prompt, same effects: new password, unlock, sign out everywhere, no data deleted, same user and tenant; it refuses emails that have no account). Google-only users never have a password; they recover through Google. To list multi-tenant users use `SELECT u.id, u.email, u.role, t.name FROM users u JOIN tenants t ON t.id = u.tenant_id`. To delete a tenant and everything in it (confirm first) run `DELETE FROM tenants WHERE id = ?`; cascades remove its users, sessions and every table that references `tenants(id)`.
 
 There is no self-service reset. Recovery is done from the CLI by anyone who is logged into the Cloudflare account with `wrangler`. That login is the trust anchor.
 
@@ -162,6 +229,10 @@ Optional upgrades (offer them, don't build them by default):
 - `Secure` cookies still work on `http://localhost` in browsers and curl, so there's no need for a dev-only cookie flag.
 - Validate user-supplied URLs server-side and allow only `http:` and `https:` (blocks `javascript:` links). Accept images only as `data:image/(png|jpeg|webp)` with a size cap, and never SVG.
 - Cloudflare Access is unnecessary when this auth is in place. Mention it only if the user wants SSO.
+- **Google says `redirect_uri_mismatch`**: the exact callback URL (scheme, host, port, path) is missing from the OAuth client. The app builds it from the address in the browser, so `localhost:8788`, the `pages.dev` URL and any custom domain each need an entry.
+- **Google sign-in returns "Google sign-in is not configured" (501)**: `GOOGLE_CLIENT_SECRET` is a Pages secret and only takes effect on the next deployment; push again. Locally it must be in `.dev.vars`, and `GOOGLE_CLIENT_ID` in `wrangler.toml` `[vars]`.
+- **Only some people can use Google sign-in**: the consent screen is still in Testing mode. Publish it.
+- Multi-tenant Pages Functions: `last_insert_rowid()` inside `env.DB.batch([...])` is what links the new user to the new tenant. Keep tenant and user creation in one batch so a failed insert leaves no orphan tenant.
 
 ## Optional add-ons (offer, don't assume)
 
